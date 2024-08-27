@@ -1,0 +1,191 @@
+#!/bin/bash
+
+# Define log files
+SETUP_LOG="/tmp/setup_output.log"
+NGINX_LOG="/tmp/nginx_service.log"
+DOCKER_LOG="/tmp/docker_service.log"
+CERTBOT_LOG="/tmp/certbot.log"
+SSL_TEST_LOG="/tmp/ssl_test.log"
+
+# Redirect all output to the setup log
+exec > >(tee -a $SETUP_LOG) 2>&1
+
+# Update system packages
+echo "Updating system packages..."
+dnf update -y
+
+# Install necessary dependencies including Nginx
+echo "Installing required packages..."
+dnf install -y yum-utils device-mapper-persistent-data lvm2 wget firewalld curl policycoreutils-python-utils bind-utils nano nginx epel-release
+
+# Install Docker and Docker Compose
+echo "Setting up Docker repository..."
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+echo "Installing Docker..."
+dnf install -y docker-ce docker-ce-cli containerd.io
+
+# Start and enable Docker
+systemctl start docker
+systemctl enable docker
+
+# Add current user to the Docker group
+usermod -aG docker $USER
+
+echo "Installing Docker Compose..."
+DOCKER_COMPOSE_VERSION="v2.22.0"
+curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+
+# Verify Docker and Docker Compose installation
+docker --version
+docker-compose --version
+
+# Setup Swap Space if not present (4GB)
+echo "Setting up Swap space..."
+SWAPFILE=/swapfile
+if [ ! -f "$SWAPFILE" ]; then
+    dd if=/dev/zero of=$SWAPFILE bs=1G count=4
+    chmod 600 $SWAPFILE
+    mkswap $SWAPFILE
+    swapon $SWAPFILE
+    echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+fi
+
+# Enable and start firewalld
+echo "Starting and enabling Firewalld..."
+systemctl enable firewalld --now
+
+# Allow necessary ports
+echo "Configuring firewall..."
+firewall-cmd --permanent --add-service=http
+firewall-cmd --permanent --add-service=https
+firewall-cmd --permanent --add-port=8443/tcp  # For Kasm
+firewall-cmd --reload
+
+# Verify DNS resolution
+echo "Verifying DNS resolution for secure-connect.us..."
+if dig secure-connect.us +short | grep -q '74.208.127.162'; then
+    echo "DNS is correctly set up."
+else
+    echo "DNS is not set up correctly. Exiting."
+    exit 1
+fi
+
+# Download and install Kasm
+KASM_VERSION="1.15.0.06fdc8"
+echo "Downloading Kasm release..."
+wget https://kasm-static-content.s3.amazonaws.com/kasm_release_${KASM_VERSION}.tar.gz -O kasm_release_${KASM_VERSION}.tar.gz
+echo "Extracting Kasm release..."
+tar -xvzf kasm_release_${KASM_VERSION}.tar.gz || { echo "Failed to extract Kasm release. Exiting."; exit 1; }
+cd kasm_release
+
+# Pre-check Kasm requirements
+echo "Checking for required Kasm service images..."
+# Add validation for service images or re-download missing ones if necessary
+
+# Run Kasm installation script and log the output
+echo "Running Kasm installation script..."
+./install.sh -s | tee /tmp/kasm_install.log || { echo "Kasm installation failed. Exiting."; exit 1; }
+
+# Capture Kasm credentials to a file
+grep -i 'Admin' /tmp/kasm_install.log > /tmp/kasm_credentials
+
+# Nginx SSL configuration
+echo "Configuring Nginx for SSL..."
+NGINX_CONF="/etc/nginx/nginx.conf"
+SSL_CERT="/mnt/data/www.secure-connect.us_ssl_certificate.cer"
+SSL_CERT_KEY="/mnt/data/www.secure-connect.us_private_key.key"
+SSL_INTERMEDIATE="/mnt/data/www.secure-connect.us_ssl_certificate_INTERMEDIATE.cer"
+
+cat <<EOL > $NGINX_CONF
+user  nginx;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                      '\$status \$body_bytes_sent "\$http_referer" '
+                      '"\$http_user_agent" "\$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    server {
+        listen       80;
+        server_name  secure-connect.us;
+
+        location / {
+            return 301 https://\$host\$request_uri;
+        }
+    }
+
+    server {
+        listen 443 ssl;
+        server_name secure-connect.us;
+
+        ssl_certificate     $SSL_CERT;
+        ssl_certificate_key $SSL_CERT_KEY;
+        ssl_trusted_certificate $SSL_INTERMEDIATE;
+
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Content-Type-Options nosniff;
+        add_header X-Frame-Options DENY;
+
+        location / {
+            proxy_pass http://localhost:8443;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+    }
+}
+EOL
+
+# Validate Nginx configuration before starting
+nginx -t | tee $NGINX_LOG || { echo "Nginx configuration is invalid. Exiting."; exit 1; }
+
+# Start and enable Nginx, log the status
+systemctl restart nginx 2>&1 | tee -a $NGINX_LOG || { echo "Nginx failed to start. Check the configuration and try again."; exit 1; }
+systemctl enable nginx
+
+# Install Certbot from EPEL repository and log the output
+echo "Installing Certbot..."
+dnf install -y certbot python3-certbot-nginx 2>&1 | tee -a $CERTBOT_LOG || { echo "Failed to install Certbot. Exiting."; exit 1; }
+
+# Stop Nginx, Renew SSL Certificates, Restart Nginx, and log the output
+certbot --nginx -d secure-connect.us --non-interactive --agree-tos --email restorationgroup@pm.me 2>&1 | tee -a $CERTBOT_LOG || { echo "Certbot failed. Exiting."; exit 1; }
+
+# Configure auto-renewal cron job
+(crontab -l ; echo "0 0 * * 0 systemctl stop nginx && certbot renew --quiet --post-hook 'systemctl start nginx'") | crontab -
+
+# Capture Docker and Nginx logs after setup
+echo "Capturing Docker and Nginx logs..."
+journalctl -xeu nginx.service > $NGINX_LOG
+docker logs > $DOCKER_LOG
+
+# SSL Configuration Test
+echo "Testing SSL configuration..."
+openssl s_client -connect secure-connect.us:443 -servername secure-connect.us < /dev/null 2>&1 | tee $SSL_TEST_LOG
+
+# Clean up
+echo "Cleaning up..."
+rm -rf /tmp/kasm_release*
+
+echo "Kasm Server setup with HTTPS is complete!"
+echo "Visit https://secure-connect.us to access the Kasm server."
