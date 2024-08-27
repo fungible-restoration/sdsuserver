@@ -53,6 +53,17 @@ firewall-cmd --reload
 echo "Installing Nginx..."
 dnf install -y nginx
 
+# Set the ownership of the SSL certificates and key to the nginx user
+echo "Setting ownership and permissions for SSL files..."
+chown nginx:nginx /mnt/data/www.secure-connect.us_ssl_certificate.cer
+chown nginx:nginx /mnt/data/www.secure-connect.us_private_key.key
+chown nginx:nginx /mnt/data/www.secure-connect.us_ssl_certificate_INTERMEDIATE.cer
+
+# Set restrictive permissions on the SSL certificates and key
+chmod 600 /mnt/data/www.secure-connect.us_ssl_certificate.cer
+chmod 600 /mnt/data/www.secure-connect.us_private_key.key
+chmod 600 /mnt/data/www.secure-connect.us_ssl_certificate_INTERMEDIATE.cer
+
 # Nginx SSL configuration
 echo "Configuring Nginx for SSL..."
 NGINX_CONF="/etc/nginx/nginx.conf"
@@ -121,15 +132,24 @@ echo "Starting Nginx..."
 systemctl restart nginx
 systemctl enable nginx
 
-# Install Kasm
-echo "Installing Kasm..."
+# Install Kasm Workspaces
+echo "Downloading Kasm Workspaces..."
+KASM_VERSION="1.15.0.06fdc8"
+wget https://kasm-static-content.s3.amazonaws.com/kasm_release_${KASM_VERSION}.tar.gz -O /tmp/kasm_release_${KASM_VERSION}.tar.gz
+
+echo "Extracting Kasm Workspaces..."
+cd /tmp
+tar -xvzf kasm_release_${KASM_VERSION}.tar.gz
+
+echo "Installing Kasm Workspaces..."
 cd /tmp/kasm_release
 ./install.sh -s
 
 # Capture Kasm credentials
 echo "Capturing Kasm credentials..."
-grep -i 'Admin' /tmp/kasm_install.log > /tmp/kasm_credentials
+grep -i 'Admin' /tmp/kasm_release/kasm_install.log > /tmp/kasm_credentials
 
 # Final message
 echo "Kasm installation completed. Credentials saved to /tmp/kasm_credentials."
 echo "Visit https://secure-connect.us to access the Kasm server."
+
